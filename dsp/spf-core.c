@@ -19,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/jiffies.h>
+#include <linux/workqueue.h>
 #include <ipc/gpr-lite.h>
 #include <dsp/spf-core.h>
 #include <dsp/digital-cdc-rsc-mgr.h>
@@ -31,6 +32,7 @@
 #define APM_CMD_RSP_GET_SPF_STATE 0x02001007
 #define APM_MODULE_INSTANCE_ID   0x00000001
 #define GPR_SVC_ADSP_CORE 0x3
+#define SPF_CORE_CHILD_RETRY_MS 1000
 
 struct spf_core {
 	struct gpr_device *adev;
@@ -41,11 +43,14 @@ struct spf_core {
 };
 
 struct spf_core_private {
-        struct device *dev;
+	struct device *dev;
 	struct mutex lock;
-        struct spf_core *spf_core_drv;
-        bool is_initial_boot;
-        struct work_struct add_chld_dev_work;
+	struct spf_core *spf_core_drv;
+	bool children_populated;
+	bool populate_in_progress;
+	bool shutting_down;
+	unsigned int gpr_generation;
+	struct delayed_work add_chld_dev_work;
 };
 
 static struct spf_core_private *spf_core_priv;
@@ -75,6 +80,8 @@ static int spf_core_callback(struct gpr_device *adev, void *data)
 	struct spf_cmd_basic_rsp *basic_rsp;
 	struct gpr_hdr *hdr = data;
 
+	if (!core)
+		return -ENODEV;
 
 	dev_info(&adev->dev ,"%s: Payload %x",__func__, hdr->opcode);
 	switch (hdr->opcode) {
@@ -274,43 +281,69 @@ EXPORT_SYMBOL_GPL(spf_core_apm_close_all);
 
 static int spf_core_probe(struct gpr_device *adev)
 {
+	struct spf_core_private *priv = spf_core_priv;
 	struct spf_core *core;
+	int ret = 0;
+
 	pr_err("%s",__func__);
-	if (!spf_core_priv) {
+	if (!priv) {
 		pr_err("%s: spf_core platform probe not yet done\n", __func__);
 		return -EPROBE_DEFER;
 	}
-	mutex_lock(&spf_core_priv->lock);
-	core = kzalloc(sizeof(*core), GFP_KERNEL);
-	if (!core) {
-		mutex_unlock(&spf_core_priv->lock);
-		return -ENOMEM;
-	}
 
-	dev_set_drvdata(&adev->dev, core);
+	core = kzalloc(sizeof(*core), GFP_KERNEL);
+	if (!core)
+		return -ENOMEM;
 
 	mutex_init(&core->lock);
 	core->adev = adev;
 	init_waitqueue_head(&core->wait);
-	spf_core_priv->spf_core_drv = core;
-	if (spf_core_priv->is_initial_boot)
-		schedule_work(&spf_core_priv->add_chld_dev_work);
-	mutex_unlock(&spf_core_priv->lock);
+
+	mutex_lock(&priv->lock);
+	if (priv->shutting_down) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (priv->spf_core_drv) {
+		dev_err(&adev->dev, "SPF core service is already registered\n");
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	dev_set_drvdata(&adev->dev, core);
+	priv->spf_core_drv = core;
+	priv->gpr_generation++;
+	if (!priv->children_populated)
+		mod_delayed_work(system_wq, &priv->add_chld_dev_work, 0);
+	mutex_unlock(&priv->lock);
 
 	return 0;
+
+unlock:
+	mutex_unlock(&priv->lock);
+	kfree(core);
+	return ret;
 }
 
 static int spf_core_exit(struct gpr_device *adev)
 {
+	struct spf_core_private *priv = spf_core_priv;
 	struct spf_core *core = dev_get_drvdata(&adev->dev);
-	if (!spf_core_priv) {
+
+	if (!priv) {
 		pr_err("%s: spf_core platform probe not yet done\n", __func__);
-		return -1;
+		return -ENODEV;
 	}
-	mutex_lock(&spf_core_priv->lock);
-	spf_core_priv->spf_core_drv = NULL;
+
+	mutex_lock(&priv->lock);
+	if (priv->spf_core_drv == core) {
+		priv->spf_core_drv = NULL;
+		priv->gpr_generation++;
+	}
+	dev_set_drvdata(&adev->dev, NULL);
+	mutex_unlock(&priv->lock);
+
 	kfree(core);
-        mutex_unlock(&spf_core_priv->lock);
 	return 0;
 }
 
@@ -332,49 +365,113 @@ static struct gpr_driver qcom_spf_core_driver = {
 
 static void spf_core_add_child_devices(struct work_struct *work)
 {
+	struct spf_core_private *priv = container_of(to_delayed_work(work),
+			struct spf_core_private, add_chld_dev_work);
+	bool population_valid;
+	unsigned long delay;
+	unsigned int generation;
 	int ret;
-        pr_err("%s:enumarate machine driver\n", __func__);
 
-	if(spf_core_is_apm_ready()) {
-		dev_err(spf_core_priv->dev, "%s: apm is up\n",
-			__func__);
-	} else {
-		dev_err(spf_core_priv->dev, "%s: apm is not up\n",
-			__func__);
+	mutex_lock(&priv->lock);
+	if (priv->shutting_down || priv->children_populated ||
+	    priv->populate_in_progress || !priv->spf_core_drv) {
+		mutex_unlock(&priv->lock);
+		return;
+	}
+	generation = priv->gpr_generation;
+	mutex_unlock(&priv->lock);
+
+	pr_info("%s: enumerate machine driver\n", __func__);
+	if (!spf_core_is_apm_ready()) {
+		dev_warn(priv->dev, "%s: APM is not ready, retrying\n",
+			 __func__);
+		mutex_lock(&priv->lock);
+		if (!priv->shutting_down && !priv->children_populated &&
+		    !priv->populate_in_progress && priv->spf_core_drv) {
+			delay = priv->gpr_generation == generation ?
+				msecs_to_jiffies(SPF_CORE_CHILD_RETRY_MS) : 0;
+
+			mod_delayed_work(system_wq, &priv->add_chld_dev_work,
+					 delay);
+		}
+		mutex_unlock(&priv->lock);
 		return;
 	}
 
-	ret = of_platform_populate(spf_core_priv->dev->of_node,
-			NULL, NULL, spf_core_priv->dev);
-	if (ret)
-		dev_err(spf_core_priv->dev, "%s: failed to add child nodes, ret=%d\n",
+	mutex_lock(&priv->lock);
+	if (priv->shutting_down || priv->children_populated ||
+	    priv->populate_in_progress || !priv->spf_core_drv) {
+		mutex_unlock(&priv->lock);
+		return;
+	}
+	if (priv->gpr_generation != generation) {
+		mod_delayed_work(system_wq, &priv->add_chld_dev_work, 0);
+		mutex_unlock(&priv->lock);
+		return;
+	}
+	priv->populate_in_progress = true;
+	mutex_unlock(&priv->lock);
+
+	ret = of_platform_populate(priv->dev->of_node, NULL, NULL, priv->dev);
+
+	mutex_lock(&priv->lock);
+	priv->populate_in_progress = false;
+	population_valid = !ret && !priv->shutting_down &&
+		priv->spf_core_drv && priv->gpr_generation == generation;
+	if (population_valid) {
+		priv->children_populated = true;
+	} else if (ret) {
+		dev_err(priv->dev,
+			"%s: failed to add child nodes, ret=%d; retrying\n",
 			__func__, ret);
+	} else {
+		dev_warn(priv->dev,
+			 "%s: GPR changed while adding child nodes; retrying\n",
+			 __func__);
+	}
+	mutex_unlock(&priv->lock);
 
-        spf_core_priv->is_initial_boot = false;
+	if (population_valid)
+		return;
 
+	/* Child removal can call back into SPF, so never depopulate under lock. */
+	of_platform_depopulate(priv->dev);
+
+	mutex_lock(&priv->lock);
+	if (!priv->shutting_down && !priv->children_populated &&
+	    priv->spf_core_drv)
+		mod_delayed_work(system_wq, &priv->add_chld_dev_work,
+				 msecs_to_jiffies(SPF_CORE_CHILD_RETRY_MS));
+	mutex_unlock(&priv->lock);
 }
 
 static int spf_core_platform_driver_probe(struct platform_device *pdev)
 {
+	struct spf_core_private *priv;
 	int ret = 0;
-        pr_err("%s",__func__);
 
-	spf_core_priv = devm_kzalloc(&pdev->dev, sizeof(struct spf_core_private), GFP_KERNEL);
-	if (!spf_core_priv)
+	pr_err("%s",__func__);
+
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
 		return -ENOMEM;
 
-	spf_core_priv->dev = &pdev->dev;
+	priv->dev = &pdev->dev;
+	mutex_init(&priv->lock);
+	INIT_DELAYED_WORK(&priv->add_chld_dev_work,
+			  spf_core_add_child_devices);
+	platform_set_drvdata(pdev, priv);
+	spf_core_priv = priv;
+	digital_cdc_rsc_mgr_init();
 
-	mutex_init(&spf_core_priv->lock);
-
-	INIT_WORK(&spf_core_priv->add_chld_dev_work, spf_core_add_child_devices);
-
-	spf_core_priv->is_initial_boot = true;
 	ret = gpr_driver_register(&qcom_spf_core_driver);
 	if (ret) {
 		pr_err("%s: gpr driver register failed = %d\n",
 			__func__, ret);
-		ret = 0;
+		digital_cdc_rsc_mgr_exit();
+		spf_core_priv = NULL;
+		platform_set_drvdata(pdev, NULL);
+		return ret;
 	}
 
 #if 0
@@ -385,17 +482,30 @@ static int spf_core_platform_driver_probe(struct platform_device *pdev)
 		ret = 0;
 	}
 #endif
-    digital_cdc_rsc_mgr_init();
-
 	return ret;
 }
 
 static int spf_core_platform_driver_remove(struct platform_device *pdev)
 {
+	struct spf_core_private *priv = platform_get_drvdata(pdev);
+
+	if (!priv)
+		return 0;
+
+	mutex_lock(&priv->lock);
+	priv->shutting_down = true;
+	mutex_unlock(&priv->lock);
+	cancel_delayed_work_sync(&priv->add_chld_dev_work);
+
+	/* This also clears OF_POPULATED flags after a partial populate. */
+	of_platform_depopulate(&pdev->dev);
+
 	//snd_event_client_deregister(&pdev->dev);
-        gpr_driver_unregister(&qcom_spf_core_driver);
-	spf_core_priv = NULL;
-    digital_cdc_rsc_mgr_exit();
+	gpr_driver_unregister(&qcom_spf_core_driver);
+	digital_cdc_rsc_mgr_exit();
+	if (spf_core_priv == priv)
+		spf_core_priv = NULL;
+	platform_set_drvdata(pdev, NULL);
 	return 0;
 }
 
