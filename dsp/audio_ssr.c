@@ -21,7 +21,7 @@
 void *audio_ssr_register(const char *domain_name, struct notifier_block *nb)
 {
 	if (domain_name  == NULL) {
-		pr_err("%s: Invalid domain name  %d\n", __func__);
+		pr_err("%s: Invalid domain name\n", __func__);
 		return ERR_PTR(-EINVAL);
 	}
 
@@ -43,4 +43,3 @@ int audio_ssr_deregister(void *handle, struct notifier_block *nb)
 	return qcom_unregister_ssr_notifier(handle, nb);
 }
 EXPORT_SYMBOL(audio_ssr_deregister);
-
