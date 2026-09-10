@@ -44,8 +44,6 @@
 #include "msm-audio-defs.h"
 #include "msm_common.h"
 #include "msm_dailink.h"
-#include "hwid.h"
-
 #if IS_ENABLED(CONFIG_MIEV)
 #include <miev/mievent.h>
 #include <linux/timer.h>
@@ -1531,10 +1529,11 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev,
 	u32 val = 0;
 	const struct of_device_id *match;
 	int i = 0;
-	u32 is_pre_dev_version = 0;
-	u32 is_pre_dev_platform = 0;
-	is_pre_dev_version = get_hw_id_value();
-	is_pre_dev_platform = get_hw_version_platform();
+	bool use_pre_dev_tdm_links;
+
+	/* Keep the legacy prototype quirk board-described and optional. */
+	use_pre_dev_tdm_links = of_property_read_bool(dev->of_node,
+		"xiaomi,pre-dev-tdm-links");
 
 	printk("<%s><%d>: E.\n", __func__, __LINE__);
 	match = of_match_node(waipio_asoc_machine_of_match, dev->of_node);
@@ -1613,11 +1612,9 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev,
 			dev_dbg(dev, "%s(): tdm-audio-intf support present\n",
 				__func__);
 
-			if (((is_pre_dev_version == 0x10003) ||
-			     (is_pre_dev_version == 0x10004)) &&
-			    (is_pre_dev_platform == HARDWARE_PROJECT_L1)) {
-				dev_err(dev, "%s(): is_pre_dev_version: %x\n",
-					__func__, is_pre_dev_version);
+			if (use_pre_dev_tdm_links) {
+				dev_dbg(dev, "%s: applying pre-development TDM links\n",
+					__func__);
 				for (i = 0; i < ARRAY_SIZE(msm_tdm_dai_links);
 				     i++) {
 					if (!strcmp(msm_tdm_dai_links[i].name,
